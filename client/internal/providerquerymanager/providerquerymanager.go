@@ -22,8 +22,8 @@ const (
 type inProgressRequestStatus struct {
 	ctx            context.Context
 	cancelFn       func()
-	providersSoFar []peer.ID
-	listeners      map[chan peer.ID]struct{}
+	providersSoFar []peer.AddrInfo
+	listeners      map[chan peer.AddrInfo]struct{}
 }
 
 type findProviderRequest struct {
@@ -35,7 +35,7 @@ type findProviderRequest struct {
 // peers.
 type ProviderQueryNetwork interface {
 	ConnectTo(context.Context, peer.ID) error
-	FindProvidersAsync(context.Context, cid.Cid, int) <-chan peer.ID
+	FindProvidersAsync(context.Context, cid.Cid, int) <-chan peer.AddrInfo
 }
 
 type providerQueryMessage interface {
@@ -46,7 +46,7 @@ type providerQueryMessage interface {
 type receivedProviderMessage struct {
 	ctx context.Context
 	k   cid.Cid
-	p   peer.ID
+	p   peer.AddrInfo
 }
 
 type finishedProviderQueryMessage struct {
@@ -61,7 +61,7 @@ type newProvideQueryMessage struct {
 }
 
 type cancelRequestMessage struct {
-	incomingProviders chan peer.ID
+	incomingProviders chan peer.AddrInfo
 	k                 cid.Cid
 }
 
@@ -106,8 +106,8 @@ func (pqm *ProviderQueryManager) Startup() {
 }
 
 type inProgressRequest struct {
-	providersSoFar []peer.ID
-	incoming       chan peer.ID
+	providersSoFar []peer.AddrInfo
+	incoming       chan peer.AddrInfo
 }
 
 // SetFindProviderTimeout changes the timeout for finding providers
@@ -118,7 +118,7 @@ func (pqm *ProviderQueryManager) SetFindProviderTimeout(findProviderTimeout time
 }
 
 // FindProvidersAsync finds providers for the given block.
-func (pqm *ProviderQueryManager) FindProvidersAsync(sessionCtx context.Context, k cid.Cid) <-chan peer.ID {
+func (pqm *ProviderQueryManager) FindProvidersAsync(sessionCtx context.Context, k cid.Cid) <-chan peer.AddrInfo {
 	inProgressRequestChan := make(chan inProgressRequest)
 
 	select {
@@ -128,11 +128,11 @@ func (pqm *ProviderQueryManager) FindProvidersAsync(sessionCtx context.Context, 
 		inProgressRequestChan: inProgressRequestChan,
 	}:
 	case <-pqm.ctx.Done():
-		ch := make(chan peer.ID)
+		ch := make(chan peer.AddrInfo)
 		close(ch)
 		return ch
 	case <-sessionCtx.Done():
-		ch := make(chan peer.ID)
+		ch := make(chan peer.AddrInfo)
 		close(ch)
 		return ch
 	}
@@ -143,7 +143,7 @@ func (pqm *ProviderQueryManager) FindProvidersAsync(sessionCtx context.Context, 
 	var receivedInProgressRequest inProgressRequest
 	select {
 	case <-pqm.ctx.Done():
-		ch := make(chan peer.ID)
+		ch := make(chan peer.AddrInfo)
 		close(ch)
 		return ch
 	case receivedInProgressRequest = <-inProgressRequestChan:
@@ -152,27 +152,27 @@ func (pqm *ProviderQueryManager) FindProvidersAsync(sessionCtx context.Context, 
 	return pqm.receiveProviders(sessionCtx, k, receivedInProgressRequest)
 }
 
-func (pqm *ProviderQueryManager) receiveProviders(sessionCtx context.Context, k cid.Cid, receivedInProgressRequest inProgressRequest) <-chan peer.ID {
+func (pqm *ProviderQueryManager) receiveProviders(sessionCtx context.Context, k cid.Cid, receivedInProgressRequest inProgressRequest) <-chan peer.AddrInfo {
 	// maintains an unbuffered queue for incoming providers for given request for a given session
 	// essentially, as a provider comes in, for a given CID, we want to immediately broadcast to all
 	// sessions that queried that CID, without worrying about whether the client code is actually
 	// reading from the returned channel -- so that the broadcast never blocks
 	// based on: https://medium.com/capital-one-tech/building-an-unbounded-channel-in-go-789e175cd2cd
-	returnedProviders := make(chan peer.ID)
-	receivedProviders := append([]peer.ID(nil), receivedInProgressRequest.providersSoFar[0:]...)
+	returnedProviders := make(chan peer.AddrInfo)
+	receivedProviders := append([]peer.AddrInfo(nil), receivedInProgressRequest.providersSoFar[0:]...)
 	incomingProviders := receivedInProgressRequest.incoming
 
 	go func() {
 		defer close(returnedProviders)
-		outgoingProviders := func() chan<- peer.ID {
+		outgoingProviders := func() chan<- peer.AddrInfo {
 			if len(receivedProviders) == 0 {
 				return nil
 			}
 			return returnedProviders
 		}
-		nextProvider := func() peer.ID {
+		nextProvider := func() peer.AddrInfo {
 			if len(receivedProviders) == 0 {
-				return ""
+				return peer.AddrInfo{}
 			}
 			return receivedProviders[0]
 		}
@@ -199,7 +199,7 @@ func (pqm *ProviderQueryManager) receiveProviders(sessionCtx context.Context, k 
 	return returnedProviders
 }
 
-func (pqm *ProviderQueryManager) cancelProviderRequest(k cid.Cid, incomingProviders chan peer.ID) {
+func (pqm *ProviderQueryManager) cancelProviderRequest(k cid.Cid, incomingProviders chan peer.AddrInfo) {
 	cancelMessageChannel := pqm.providerQueryMessages
 	for {
 		select {
@@ -239,9 +239,9 @@ func (pqm *ProviderQueryManager) findProviderWorker() {
 			wg := &sync.WaitGroup{}
 			for p := range providers {
 				wg.Add(1)
-				go func(p peer.ID) {
+				go func(p peer.AddrInfo) {
 					defer wg.Done()
-					err := pqm.network.ConnectTo(findProviderCtx, p)
+					err := pqm.network.ConnectTo(findProviderCtx, p.ID)
 					if err != nil {
 						log.Debugf("failed to connect to provider %s: %s", p, err)
 						return
@@ -381,7 +381,7 @@ func (npqm *newProvideQueryMessage) handle(pqm *ProviderQueryManager) {
 
 		ctx, cancelFn := context.WithCancel(pqm.ctx)
 		requestStatus = &inProgressRequestStatus{
-			listeners: make(map[chan peer.ID]struct{}),
+			listeners: make(map[chan peer.AddrInfo]struct{}),
 			ctx:       ctx,
 			cancelFn:  cancelFn,
 		}
@@ -395,7 +395,7 @@ func (npqm *newProvideQueryMessage) handle(pqm *ProviderQueryManager) {
 			return
 		}
 	}
-	inProgressChan := make(chan peer.ID)
+	inProgressChan := make(chan peer.AddrInfo)
 	requestStatus.listeners[inProgressChan] = struct{}{}
 	select {
 	case npqm.inProgressRequestChan <- inProgressRequest{

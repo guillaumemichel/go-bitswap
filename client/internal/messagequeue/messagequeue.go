@@ -16,6 +16,8 @@ import (
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"go.uber.org/zap"
+
+	"github.com/ipfs/go-bitswap/measurements"
 )
 
 var log = logging.Logger("bitswap")
@@ -637,13 +639,16 @@ func (mq *MessageQueue) handleResponse(ks []cid.Cid) {
 func (mq *MessageQueue) logOutgoingMessage(wantlist []bsmsg.Entry) {
 	// Save some CPU cycles and allocations if log level is higher than debug
 	if ce := sflog.Check(zap.DebugLevel, "sent message"); ce == nil {
-		return
+		//return
 	}
 
 	self := mq.network.Self()
 	for _, e := range wantlist {
+		timestamp := time.Now().Format("2006-01-02T15:04:05.999Z") + ","
+		cidPeerid := "," + e.Cid.String() + "," + mq.p.String()
 		if e.Cancel {
 			if e.WantType == pb.Message_Wantlist_Have {
+				measurements.LogStringToFile(timestamp+"CANCEL_WANT_HAVE"+cidPeerid, measurements.PACKETSLOGS)
 				log.Debugw("sent message",
 					"type", "CANCEL_WANT_HAVE",
 					"cid", e.Cid,
@@ -651,6 +656,7 @@ func (mq *MessageQueue) logOutgoingMessage(wantlist []bsmsg.Entry) {
 					"to", mq.p,
 				)
 			} else {
+				measurements.LogStringToFile(timestamp+"CANCEL_WANT_BLOCK"+cidPeerid, measurements.PACKETSLOGS)
 				log.Debugw("sent message",
 					"type", "CANCEL_WANT_BLOCK",
 					"cid", e.Cid,
@@ -660,6 +666,7 @@ func (mq *MessageQueue) logOutgoingMessage(wantlist []bsmsg.Entry) {
 			}
 		} else {
 			if e.WantType == pb.Message_Wantlist_Have {
+				measurements.LogStringToFile(timestamp+"WANT_HAVE"+cidPeerid, measurements.PACKETSLOGS)
 				log.Debugw("sent message",
 					"type", "WANT_HAVE",
 					"cid", e.Cid,
@@ -667,6 +674,7 @@ func (mq *MessageQueue) logOutgoingMessage(wantlist []bsmsg.Entry) {
 					"to", mq.p,
 				)
 			} else {
+				measurements.LogStringToFile(timestamp+"WANT_BLOCK"+cidPeerid, measurements.PACKETSLOGS)
 				log.Debugw("sent message",
 					"type", "WANT_BLOCK",
 					"cid", e.Cid,

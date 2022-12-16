@@ -6,6 +6,7 @@ import (
 
 	bsmsg "github.com/ipfs/go-bitswap/message"
 	"github.com/ipfs/go-bitswap/network/internal"
+	"github.com/libp2p/go-libp2p/core/host"
 
 	cid "github.com/ipfs/go-cid"
 
@@ -27,6 +28,7 @@ var (
 
 // BitSwapNetwork provides network connectivity for BitSwap sessions.
 type BitSwapNetwork interface {
+	Host() host.Host
 	Self() peer.ID
 
 	// SendMessage sends a BitSwap message to a peer.
@@ -88,7 +90,7 @@ type Receiver interface {
 // network.
 type Routing interface {
 	// FindProvidersAsync returns a channel of providers for the given key.
-	FindProvidersAsync(context.Context, cid.Cid, int) <-chan peer.ID
+	FindProvidersAsync(context.Context, cid.Cid, int) <-chan peer.AddrInfo
 
 	// Provide provides the key to the network.
 	Provide(context.Context, cid.Cid) error

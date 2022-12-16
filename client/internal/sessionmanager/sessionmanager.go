@@ -17,6 +17,7 @@ import (
 	bssession "github.com/ipfs/go-bitswap/client/internal/session"
 	bssim "github.com/ipfs/go-bitswap/client/internal/sessioninterestmanager"
 	exchange "github.com/ipfs/go-ipfs-exchange-interface"
+	"github.com/libp2p/go-libp2p/core/host"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -40,7 +41,7 @@ type SessionFactory func(
 	notif notifications.PubSub,
 	provSearchDelay time.Duration,
 	rebroadcastDelay delay.D,
-	self peer.ID) Session
+	host host.Host) Session
 
 // PeerManagerFactory generates a new peer manager for a session.
 type PeerManagerFactory func(ctx context.Context, id uint64) bssession.SessionPeerManager
@@ -65,11 +66,12 @@ type SessionManager struct {
 	sessID   uint64
 
 	self peer.ID
+	host host.Host
 }
 
 // New creates a new SessionManager.
 func New(ctx context.Context, sessionFactory SessionFactory, sessionInterestManager *bssim.SessionInterestManager, peerManagerFactory PeerManagerFactory,
-	blockPresenceManager *bsbpm.BlockPresenceManager, peerManager bssession.PeerManager, notif notifications.PubSub, self peer.ID) *SessionManager {
+	blockPresenceManager *bsbpm.BlockPresenceManager, peerManager bssession.PeerManager, notif notifications.PubSub, host host.Host) *SessionManager {
 
 	return &SessionManager{
 		ctx:                    ctx,
@@ -80,7 +82,8 @@ func New(ctx context.Context, sessionFactory SessionFactory, sessionInterestMana
 		peerManager:            peerManager,
 		notif:                  notif,
 		sessions:               make(map[uint64]Session),
-		self:                   self,
+		self:                   host.ID(),
+		host:                   host,
 	}
 }
 
@@ -95,7 +98,7 @@ func (sm *SessionManager) NewSession(ctx context.Context,
 	defer span.End()
 
 	pm := sm.peerManagerFactory(ctx, id)
-	session := sm.sessionFactory(ctx, sm, id, pm, sm.sessionInterestManager, sm.peerManager, sm.blockPresenceManager, sm.notif, provSearchDelay, rebroadcastDelay, sm.self)
+	session := sm.sessionFactory(ctx, sm, id, pm, sm.sessionInterestManager, sm.peerManager, sm.blockPresenceManager, sm.notif, provSearchDelay, rebroadcastDelay, sm.host)
 
 	sm.sessLk.Lock()
 	if sm.sessions != nil { // check if SessionManager was shutdown

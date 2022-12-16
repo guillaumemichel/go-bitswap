@@ -211,6 +211,10 @@ func (s *streamMessageSender) send(ctx context.Context, msg bsmsg.BitSwapMessage
 	return nil
 }
 
+func (bsnet *impl) Host() host.Host {
+	return bsnet.host
+}
+
 func (bsnet *impl) Self() peer.ID {
 	return bsnet.host.ID()
 }
@@ -374,8 +378,8 @@ func (bsnet *impl) DisconnectFrom(ctx context.Context, p peer.ID) error {
 }
 
 // FindProvidersAsync returns a channel of providers for the given key.
-func (bsnet *impl) FindProvidersAsync(ctx context.Context, k cid.Cid, max int) <-chan peer.ID {
-	out := make(chan peer.ID, max)
+func (bsnet *impl) FindProvidersAsync(ctx context.Context, k cid.Cid, max int) <-chan peer.AddrInfo {
+	out := make(chan peer.AddrInfo, max)
 	go func() {
 		defer close(out)
 		providers := bsnet.routing.FindProvidersAsync(ctx, k, max)
@@ -387,7 +391,7 @@ func (bsnet *impl) FindProvidersAsync(ctx context.Context, k cid.Cid, max int) <
 			select {
 			case <-ctx.Done():
 				return
-			case out <- info.ID:
+			case out <- info:
 			}
 		}
 	}()

@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/ipfs/go-bitswap/client/internal"
@@ -16,6 +18,11 @@ import (
 	logging "github.com/ipfs/go-log"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	"go.uber.org/zap"
+
+	selfish "github.com/guillaumemichel/go-selfish-bitswap-client"
+	"github.com/ipfs/go-bitswap/measurements"
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/host"
 )
 
 var log = logging.Logger("bs:sess")
@@ -72,7 +79,7 @@ type SessionPeerManager interface {
 // ProviderFinder is used to find providers for a given key
 type ProviderFinder interface {
 	// FindProvidersAsync searches for peers that provide the given CID
-	FindProvidersAsync(ctx context.Context, k cid.Cid) <-chan peer.ID
+	FindProvidersAsync(ctx context.Context, k cid.Cid) <-chan peer.AddrInfo
 }
 
 // opType is the kind of operation that is being processed by the event loop
@@ -92,6 +99,7 @@ const (
 )
 
 type op struct {
+	from peer.ID
 	op   opType
 	keys []cid.Cid
 }
@@ -130,6 +138,17 @@ type Session struct {
 	id    uint64
 
 	self peer.ID
+	host host.Host
+
+	bitswapOnly bool
+	dhtFound    bool
+
+	mutex *sync.Mutex
+
+	cid       cid.Cid
+	startTime time.Time
+	ttfb      int // time in ms
+	providers []peer.ID
 }
 
 // New creates a new bitswap session whose lifetime is bounded by the
@@ -146,7 +165,7 @@ func New(
 	notif notifications.PubSub,
 	initialSearchDelay time.Duration,
 	periodicSearchDelay delay.D,
-	self peer.ID) *Session {
+	host host.Host) *Session {
 
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Session{
@@ -166,7 +185,14 @@ func New(
 		id:                  id,
 		initialSearchDelay:  initialSearchDelay,
 		periodicSearchDelay: periodicSearchDelay,
-		self:                self,
+		self:                host.ID(),
+		host:                host,
+		bitswapOnly:         false,
+		dhtFound:            false,
+		mutex:               &sync.Mutex{},
+		startTime:           time.Now(),
+		ttfb:                0,
+		providers:           make([]peer.ID, 0),
 	}
 	s.sws = newSessionWantSender(id, pm, sprm, sm, bpm, s.onWantsSent, s.onPeersExhausted)
 
@@ -203,24 +229,30 @@ func (s *Session) ReceiveFrom(from peer.ID, ks []cid.Cid, haves []cid.Cid, dontH
 
 	// Inform the session that blocks have been received
 	select {
-	case s.incoming <- op{op: opReceive, keys: ks}:
+	case s.incoming <- op{op: opReceive, keys: ks, from: from}:
 	case <-s.ctx.Done():
 	}
 }
 
 func (s *Session) logReceiveFrom(from peer.ID, interestedKs []cid.Cid, haves []cid.Cid, dontHaves []cid.Cid) {
 	// Save some CPU cycles if log level is higher than debug
+	timestamp := time.Now().Format("2006-01-02T15:04:05.999Z") + ","
+	peerid := "," + from.String()
+
 	if ce := sflog.Check(zap.DebugLevel, "Bitswap <- rcv message"); ce == nil {
-		return
+		//return
 	}
 
 	for _, c := range interestedKs {
+		measurements.LogStringToFile(timestamp+"BLOCK,"+c.String()+peerid, measurements.PACKETSLOGS)
 		log.Debugw("Bitswap <- block", "local", s.self, "from", from, "cid", c, "session", s.id)
 	}
 	for _, c := range haves {
+		measurements.LogStringToFile(timestamp+"HAVE,"+c.String()+peerid, measurements.PACKETSLOGS)
 		log.Debugw("Bitswap <- HAVE", "local", s.self, "from", from, "cid", c, "session", s.id)
 	}
 	for _, c := range dontHaves {
+		measurements.LogStringToFile(timestamp+"DONT_HAVE,"+c.String()+peerid, measurements.PACKETSLOGS)
 		log.Debugw("Bitswap <- DONT_HAVE", "local", s.self, "from", from, "cid", c, "session", s.id)
 	}
 }
@@ -228,6 +260,17 @@ func (s *Session) logReceiveFrom(from peer.ID, interestedKs []cid.Cid, haves []c
 // GetBlock fetches a single block.
 func (s *Session) GetBlock(ctx context.Context, k cid.Cid) (blocks.Block, error) {
 	ctx, span := internal.StartSpan(ctx, "Session.GetBlock")
+	// get from the context if the request is bitswap only
+	bitswapOnly := ctx.Value("bitswapOnly")
+	if bitswapOnly != nil {
+		if b, ok := bitswapOnly.(bool); ok {
+			// if it is bitswap only, the session will be set as bitswap only
+			s.bitswapOnly = b
+		}
+	}
+
+	s.cid = k
+
 	defer span.End()
 	return bsgetter.SyncGetBlock(ctx, k, s.GetBlocks)
 }
@@ -299,13 +342,14 @@ func (s *Session) run(ctx context.Context) {
 
 	s.idleTick = time.NewTimer(s.initialSearchDelay)
 	s.periodicSearchTimer = time.NewTimer(s.periodicSearchDelay.NextWaitTime())
+	deadlineTimer := time.NewTimer(measurements.DISCOVERY_TIMEOUT)
 	for {
 		select {
 		case oper := <-s.incoming:
 			switch oper.op {
 			case opReceive:
 				// Received blocks
-				s.handleReceive(oper.keys)
+				s.handleReceive(oper.keys, oper.from)
 			case opWant:
 				// Client wants blocks
 				s.wantBlocks(ctx, oper.keys)
@@ -335,8 +379,102 @@ func (s *Session) run(ctx context.Context) {
 			// Shutdown
 			s.handleShutdown()
 			return
+		case <-deadlineTimer.C:
+			// bitswap timer expired, cancel request and start dht lookup
+			if s.bitswapOnly && len(s.providers) == 0 {
+				s.timesup(ctx)
+			}
 		}
 	}
+}
+
+func (s *Session) timesup(ctx context.Context) {
+	s.sw.CancelPending([]cid.Cid{s.cid})
+
+	// set timer for the dht lookup
+	dhtTimer := time.NewTimer(measurements.DHT_TIMEOUT)
+	// start the dht lookup
+	// the request has an internal 10s timeout
+
+	found := make(chan bool)
+	for prov := range s.providerFinder.FindProvidersAsync(ctx, s.cid) {
+		s.dhtFound = true
+		go func(prov peer.AddrInfo) {
+			// create a new selfish bitswap session with the discovered provider
+			selfishp2p, err := libp2p.New()
+			if err != nil {
+				fmt.Println("couldn't create selfishp2p", err)
+			}
+			// add provider peerid and multiaddresses to the new node
+			selfishp2p.Peerstore().AddAddrs(prov.ID, prov.Addrs, time.Hour)
+
+			ssession := selfish.New(selfishp2p, prov.ID)
+			// try to get the block from the selfish session
+			_, err = ssession.Get(s.cid)
+			if err == nil {
+				// if we were able to get the block, add the provider
+				// if the provider isn't already in the provider list
+				alreadyProv := false
+				for _, p := range s.providers {
+					if p == prov.ID {
+						alreadyProv = true
+					}
+				}
+				if !alreadyProv {
+					s.mutex.Lock()
+					s.providers = append(s.providers, prov.ID)
+					s.mutex.Unlock()
+				}
+
+				found <- true
+			}
+		}(prov)
+	}
+
+	if s.dhtFound {
+		select {
+		case <-found:
+		case <-dhtTimer.C:
+		}
+	}
+
+	// stop the current bitswap requests
+	s.shutdown()
+}
+
+// logResults
+// format: starttime, cid, #peerset, "NO_PROV" OR "FETCH_FAILED" OR (ttfb +) providers_peerids
+// (ttfb) provided if bitswap successfully discovered the block
+// note that the ttfb variable is currently the time to fetch the block (time to last bit)
+func (s *Session) logResults() {
+	str := s.startTime.Format("2006-01-02T15:04:05.999Z") + "," +
+		s.cid.String() + "," + fmt.Sprint(len(s.host.Network().Peers()))
+
+	if s.dhtFound {
+		// the dht lookup returned peerids
+		if len(s.providers) > 0 {
+			// selfish bitswap was able to fetch the block from at least one of these peers
+			// log the first provider
+			for _, p := range s.providers {
+				str += "," + p.String()
+			}
+		} else {
+			// selfish bitswap couldn't fetch the block from any providers
+			str += "," + measurements.FETCH_FAILED
+		}
+	} else if s.ttfb > 0 {
+		// bitswap successfully found the block within the DISCOVERY_TIMEOUT
+		// log ttfb and all successful providers
+		str += "," + fmt.Sprint(s.ttfb)
+		for _, p := range s.providers {
+			str += "," + p.String()
+		}
+	} else {
+		// the dht lookup didn't return any providers for the cid
+		str += "," + measurements.NO_PROVS
+	}
+
+	measurements.LogStringToFile(str, measurements.LOGFILE)
 }
 
 // Called when the session hasn't received any blocks for some time, or when
@@ -389,17 +527,22 @@ func (s *Session) handlePeriodicSearch(ctx context.Context) {
 // findMorePeers attempts to find more peers for a session by searching for
 // providers for the given Cid
 func (s *Session) findMorePeers(ctx context.Context, c cid.Cid) {
-	go func(k cid.Cid) {
-		for p := range s.providerFinder.FindProvidersAsync(ctx, k) {
-			// When a provider indicates that it has a cid, it's equivalent to
-			// the providing peer sending a HAVE
-			s.sws.Update(p, nil, []cid.Cid{c}, nil)
-		}
-	}(c)
+	// Bitswap only mode, don't request new providers from the DHT
+	if !s.bitswapOnly {
+		go func(k cid.Cid) {
+			for p := range s.providerFinder.FindProvidersAsync(ctx, k) {
+				// When a provider indicates that it has a cid, it's equivalent to
+				// the providing peer sending a HAVE
+				s.sws.Update(p.ID, nil, []cid.Cid{c}, nil)
+			}
+		}(c)
+	}
 }
 
 // handleShutdown is called when the session shuts down
 func (s *Session) handleShutdown() {
+	// Log bitswap measurements results
+	s.logResults()
 	// Stop the idle timer
 	s.idleTick.Stop()
 	// Shut down the session peer manager
@@ -413,12 +556,35 @@ func (s *Session) handleShutdown() {
 }
 
 // handleReceive is called when the session receives blocks from a peer
-func (s *Session) handleReceive(ks []cid.Cid) {
+func (s *Session) handleReceive(ks []cid.Cid, from peer.ID) {
+	now := time.Now()
 	// Record which blocks have been received and figure out the total latency
 	// for fetching the blocks
 	wanted, totalLatency := s.sw.BlocksReceived(ks)
 	if len(wanted) == 0 {
 		return
+	}
+	// verify if we received the target cid
+	// ideally we should only get this one
+	for _, k := range wanted {
+		if k == s.cid {
+			// record the provider peerid is not already in providers
+			alreadyProv := false
+			for _, p := range s.providers {
+				if p == from {
+					alreadyProv = true
+				}
+			}
+			if !alreadyProv {
+				s.mutex.Lock()
+				s.providers = append(s.providers, from)
+				s.mutex.Unlock()
+			}
+			if s.ttfb == 0 {
+				// record the latency only if no latency was set before, we want to smallest latency
+				s.ttfb = int(now.Sub(s.startTime).Milliseconds())
+			}
+		}
 	}
 
 	// Record latency
